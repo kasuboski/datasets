@@ -8,13 +8,13 @@ Features:
   - Resumable: reads state file on startup, skips already-processed files
   - Cost guard: stops when account balance drops below threshold
   - Structured logging to file + stdout
-  - Variable task types per file (1 task type per file → ~14K pairs from 14K files)
+  - 3 task types per file (code_gen, explanation, completion) → ~14K pairs from ~4.7K files
 
 Usage:
   NEURALWATT_API_KEY=sk-xxx python -m datasets.gleam.generate \
     --provider neuralwatt \
     --output data/sft/generation.jsonl \
-    [--max-files 14000] \
+    [--max-files 4700] \
     [--balance-limit 0.50]
 
 Resume after crash:
@@ -68,9 +68,9 @@ PROVIDERS = {
     },
 }
 
-TASK_TYPES = ["code_gen", "explanation", "completion", "code_gen", "completion"]
-# code_gen appears 2x → 40%, explanation 20%, completion 40%
-# This roughly matches the SFT strategy: 35% code gen, 15% explanation, 10% completion,
+TASK_TYPES = ["code_gen", "explanation", "completion"]
+# Each file gets all 3 task types → 3 pairs per file
+# Matches the pilot: 10 files × 3 types = 30 requests per provider
 # with remaining budget going to more code_gen/completion variants
 
 # ---------------------------------------------------------------------------
@@ -439,88 +439,87 @@ def run_generation(
             logger.error(f"Too many consecutive errors ({consecutive_errors}). Stopping.")
             break
 
-        # Pick task type deterministically based on file index
-        task_idx = (state.total_pairs + i) % len(TASK_TYPES)
-        task_type = TASK_TYPES[task_idx]
-
-        # Build prompt
-        spec = build_prompt_for_file(
-            file_id=file_id,
-            code=file_data["code"],
-            file_path=file_data["file_path"],
-            repo_name=file_data["repo_name"],
-            task_type=task_type,
-        )
-
-        # Call API with retry
-        result = call_with_retry(
-            client, provider, spec.messages, cfg, logger, max_retries=max_retries,
-        )
-
-        # Build record
-        record = {
-            "request_id": f"{provider}_{state.total_pairs:06d}",
-            "provider": provider,
-            "model": cfg["model"],
-            "task_type": task_type,
-            "source_file_id": file_id,
-            "source_file_path": file_data["file_path"],
-            "source_repo": file_data["repo_name"],
-            "source_stars": file_data.get("stars"),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            **result,
-        }
-
-        # Write immediately (crash resilience)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "a") as f:
-            f.write(json.dumps(record) + "\n")
-
-        # Update state
-        if result.get("error"):
-            state.total_errors += 1
-            consecutive_errors += 1
-            logger.info(f"  [{state.total_pairs + 1:5d}] FAIL {file_id[:50]:50s} | {task_type:12s} | {result['error'][:60]}")
-        else:
-            consecutive_errors = 0
-            state.total_pairs += 1
-            wall = result["wall_time_ms"] / 1000
-            out_tok = result["output_tokens"]
-            tps = out_tok / wall if wall > 0 else 0
-
-            # Track cost/energy
-            nw_energy = result.get("nw_energy", {})
-            nw_cost = result.get("nw_cost", {})
-            energy_j = nw_energy.get("energy_joules", 0)
-            cost_usd = nw_cost.get("request_cost_usd", 0)
-            balance = nw_cost.get("allowance_remaining_usd")
-            state.total_energy_j += energy_j
-            state.total_cost_usd += cost_usd
-            if balance is not None:
-                state.last_balance_usd = balance
-
-            # Progress log
-            elapsed = time.time() - state.start_time
-            eta = (elapsed / state.total_pairs) * (len(remaining) - i - 1) if state.total_pairs > 0 else 0
-            logger.info(
-                f"  [{state.total_pairs:5d}] OK   {file_id[:50]:50s} | {task_type:12s} "
-                f"| {wall:5.1f}s | {tps:5.0f} tok/s | {out_tok:5d} out "
-                f"| ${state.total_cost_usd:.4f} total "
-                f"| ETA {eta/3600:.1f}h"
-                + (f" | bal=${balance:.2f}" if balance is not None else "")
+        # Generate all task types for this file (matches pilot: 3 pairs per file)
+        for task_type in TASK_TYPES:
+            # Build prompt
+            spec = build_prompt_for_file(
+                file_id=file_id,
+                code=file_data["code"],
+                file_path=file_data["file_path"],
+                repo_name=file_data["repo_name"],
+                task_type=task_type,
             )
 
-            # Balance guard
-            if balance is not None and balance < balance_limit:
-                logger.warning(f"\n⚠ Balance ${balance:.4f} below limit ${balance_limit:.2f}. Stopping.")
-                state.mark_completed(file_id)
-                return
+            # Call API with retry
+            result = call_with_retry(
+                client, provider, spec.messages, cfg, logger, max_retries=max_retries,
+            )
 
-        state.mark_completed(file_id)
+            # Build record
+            record = {
+                "request_id": f"{provider}_{state.total_pairs:06d}",
+                "provider": provider,
+                "model": cfg["model"],
+                "task_type": task_type,
+                "source_file_id": file_id,
+                "source_file_path": file_data["file_path"],
+                "source_repo": file_data["repo_name"],
+                "source_stars": file_data.get("stars"),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                **result,
+            }
 
-        # Rate limiting gap
-        if i < len(remaining) - 1:
+            # Write immediately (crash resilience)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+
+            # Update state
+            if result.get("error"):
+                state.total_errors += 1
+                consecutive_errors += 1
+                logger.info(f"  [{state.total_pairs + 1:5d}] FAIL {file_id[:50]:50s} | {task_type:12s} | {result['error'][:60]}")
+            else:
+                consecutive_errors = 0
+                state.total_pairs += 1
+                wall = result["wall_time_ms"] / 1000
+                out_tok = result["output_tokens"]
+                tps = out_tok / wall if wall > 0 else 0
+
+                # Track cost/energy
+                nw_energy = result.get("nw_energy", {})
+                nw_cost = result.get("nw_cost", {})
+                energy_j = nw_energy.get("energy_joules", 0)
+                cost_usd = nw_cost.get("request_cost_usd", 0)
+                balance = nw_cost.get("allowance_remaining_usd")
+                state.total_energy_j += energy_j
+                state.total_cost_usd += cost_usd
+                if balance is not None:
+                    state.last_balance_usd = balance
+
+                # Progress log
+                elapsed = time.time() - state.start_time
+                remaining_pairs = len(remaining) * len(TASK_TYPES) - (i * len(TASK_TYPES) + TASK_TYPES.index(task_type)) - 1
+                eta = (elapsed / state.total_pairs) * remaining_pairs if state.total_pairs > 0 else 0
+                logger.info(
+                    f"  [{state.total_pairs:5d}] OK   {file_id[:50]:50s} | {task_type:12s} "
+                    f"| {wall:5.1f}s | {tps:5.0f} tok/s | {out_tok:5d} out "
+                    f"| ${state.total_cost_usd:.4f} total "
+                    f"| ETA {eta/3600:.1f}h"
+                    + (f" | bal=${balance:.2f}" if balance is not None else "")
+                )
+
+                # Balance guard
+                if balance is not None and balance < balance_limit:
+                    logger.warning(f"\n⚠ Balance ${balance:.4f} below limit ${balance_limit:.2f}. Stopping.")
+                    state.mark_completed(file_id)
+                    return
+
+            # Rate limiting gap between requests
             time.sleep(cfg["gap_seconds"])
+
+        # Mark file completed after all task types
+        state.mark_completed(file_id)
 
     # Final summary
     elapsed = time.time() - state.start_time if state.start_time else 0
@@ -547,17 +546,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # NeuralWatt, 14K files, resume-safe
-  NEURALWATT_API_KEY=sk-xxx python -m datasets.gleam.generate \\
-      --provider neuralwatt --max-files 14000
+  # NeuralWatt, ~4.7K files → ~14K pairs, resume-safe
+  NEURALWATT_API_KEY=sk-xxx python src/gleam/generate.py \\
+      --provider neuralwatt --max-files 4700
 
   # Resume after crash (just re-run same command)
-  NEURALWATT_API_KEY=sk-xxx python -m datasets.gleam.generate \\
-      --provider neuralwatt --max-files 14000
+  NEURALWATT_API_KEY=sk-xxx python src/gleam/generate.py \\
+      --provider neuralwatt --max-files 4700
 
   # Z.AI fallback
-  ZAI_API_KEY=xxx python -m datasets.gleam.generate \\
-      --provider zai --max-files 14000
+  ZAI_API_KEY=xxx python src/gleam/generate.py \\
+      --provider zai --max-files 4700
         """,
     )
     parser.add_argument(
@@ -565,8 +564,8 @@ Examples:
         help="API provider (default: neuralwatt)",
     )
     parser.add_argument(
-        "--max-files", type=int, default=14000,
-        help="Max files to process (default: 14000)",
+        "--max-files", type=int, default=4700,
+        help="Max files to process (3 pairs per file, default: 4700 ≈ 14K pairs)",
     )
     parser.add_argument(
         "--output", type=Path, default=Path("data/sft/generation.jsonl"),

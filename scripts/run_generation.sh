@@ -24,7 +24,7 @@ set -euo pipefail
 
 # --- Config ---
 PROVIDER="${PROVIDER:-neuralwatt}"
-MAX_FILES="${MAX_FILES:-14000}"
+MAX_FILES="${MAX_FILES:-4700}"
 BALANCE_LIMIT="${BALANCE_LIMIT:-0.50}"
 MAX_RESTARTS="${MAX_RESTARTS:-5}"
 SEED="${SEED:-42}"
