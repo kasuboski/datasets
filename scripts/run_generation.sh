@@ -71,8 +71,8 @@ cd "$PROJECT_DIR"
 
 # Ensure dependencies are installed
 python3 -c "import openai, polars, huggingface_hub" 2>/dev/null || {
-    echo "Installing dependencies..."
-    pip3 install openai polars huggingface_hub -q
+    echo "Installing dependencies via uv..."
+    uv sync -q
 }
 
 echo "=========================================="
@@ -91,7 +91,7 @@ while [ $restart -lt $MAX_RESTARTS ]; do
     echo ""
     echo "--- Run attempt $((restart + 1))/$MAX_RESTARTS at $(date -u '+%H:%M:%S') ---" | tee -a "$RUN_LOG"
 
-    python3 "$PROJECT_DIR/src/gleam/generate.py" \
+    uv run python3 "$PROJECT_DIR/src/gleam/generate.py" \
         --provider "$PROVIDER" \
         --max-files "$MAX_FILES" \
         --balance-limit "$BALANCE_LIMIT" \
