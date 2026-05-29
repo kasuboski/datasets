@@ -10,9 +10,9 @@ import sys
 import time
 from pathlib import Path
 
-from datasets.core.git_tools import process_repo
-from datasets.core.license_checker import is_permissive
-from datasets.gleam.registry import (
+from src.core.git_tools import process_repo
+from src.core.license_checker import is_permissive
+from src.gleam.registry import (
     RepoInfo,
     discover_github_repos,
     discover_hex_packages,

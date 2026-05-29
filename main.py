@@ -54,7 +54,7 @@ Commands:
         sys.exit(1)
 
     if args.command == "collect":
-        from datasets.gleam.build import build_corpus
+        from src.gleam.build import build_corpus
         build_corpus(
             corpus_path=args.corpus_path,
             state_path=args.state_path,
@@ -65,7 +65,7 @@ Commands:
         )
 
     elif args.command == "convert":
-        from datasets.core.hf_hub import run_conversion
+        from src.core.hf_hub import run_conversion
         run_conversion(
             jsonl_path=args.jsonl_path,
             parquet_dir=args.parquet_dir,
@@ -75,7 +75,7 @@ Commands:
         )
 
     elif args.command == "validate":
-        from datasets.core.hf_hub import validate_corpus
+        from src.core.hf_hub import validate_corpus
         import polars as pl
         if not args.corpus_path.exists():
             print(f"ERROR: {args.corpus_path} not found")
@@ -92,7 +92,7 @@ Commands:
             print("✅ No warnings")
 
     elif args.command == "push":
-        from datasets.core.hf_hub import push_only
+        from src.core.hf_hub import push_only
         push_only(
             parquet_dir=args.parquet_dir,
             dataset_id=args.dataset_id,

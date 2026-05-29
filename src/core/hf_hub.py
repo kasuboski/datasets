@@ -274,7 +274,7 @@ def run_conversion(
         print(f"\n[2/5] Skipping filters (--skip-filters)")
     else:
         print(f"\n[2/5] Filtering...")
-        from datasets.core.filters import filter_corpus
+        from src.core.filters import filter_corpus
         df = filter_corpus(df)
 
     # Validate

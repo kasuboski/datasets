@@ -25,12 +25,12 @@ from typing import Any
 # Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from datasets.gleam.pilot.prompts import (
+from src.gleam.pilot.prompts import (
     PromptSpec,
     build_agent_session,
     build_single_prompts,
 )
-from datasets.gleam.pilot.sample import (
+from src.gleam.pilot.sample import (
     SampledFile,
     print_sample_summary,
     sample_files,
@@ -54,7 +54,7 @@ PROVIDERS = {
     },
     "neuralwatt": {
         "base_url": "https://api.neuralwatt.com/v1",  # OpenAI-compatible
-        "model": "qwen3-coder-480b",
+        "model": "qwen3.6-35b-fast",  # Fast variant — reasoning model returns content=None
         "api_key_env": "NEURALWATT_API_KEY",
         "approaches": ["a"],  # only single prompts
         "gap_seconds": 0.5,
@@ -210,14 +210,18 @@ def _call_api(
             if hasattr(response.usage, "completion_tokens_details") and response.usage.completion_tokens_details:
                 result["reasoning_tokens"] = response.usage.completion_tokens_details.reasoning_tokens or 0
 
-        # NeuralWatt-specific: capture duration_seconds and energy from raw response
+        # NeuralWatt-specific: capture energy, cost, duration from response
         if provider == "neuralwatt":
             raw = response.model_dump()
-            # NeuralWatt may include extra fields in the response
-            if "duration_seconds" in raw:
-                result["duration_seconds"] = raw["duration_seconds"]
-            if "energy_mwh" in raw:
-                result["energy_mwh"] = raw["energy_mwh"]
+            # NeuralWatt returns rich energy/cost data at top level
+            if "energy" in raw and isinstance(raw["energy"], dict):
+                result["nw_energy"] = raw["energy"]
+            if "cost" in raw and isinstance(raw["cost"], dict):
+                result["nw_cost"] = raw["cost"]
+            # Store raw keys on first request for debugging
+            if not hasattr(_call_api, "_nw_raw_saved"):
+                result["_raw_response_keys"] = list(raw.keys())
+                _call_api._nw_raw_saved = True
 
         return result
 

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from datasets.core.license_checker import check_license, is_permissive
+from src.core.license_checker import check_license, is_permissive
 
 # Official Gleam orgs/repos — used to set is_official flag.
 OFFICIAL_OWNERS = frozenset({

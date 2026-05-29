@@ -5,7 +5,7 @@ Filters are split into two categories:
 2. Cross-file filters (need the full corpus, e.g. deduplication)
 
 Usage:
-    from datasets.core.filters import filter_corpus
+    from src.core.filters import filter_corpus
     df_clean = filter_corpus(df_raw)
 """
 
@@ -71,7 +71,7 @@ def filter_unlicensed(df: pl.DataFrame) -> pl.DataFrame:
 
 def filter_non_permissive(df: pl.DataFrame) -> pl.DataFrame:
     """Remove files with identified non-permissive licenses (GPL, AGPL)."""
-    from datasets.core.license_checker import NON_PERMISSIVE
+    from src.core.license_checker import NON_PERMISSIVE
     before = df.height
     df = df.filter(
         pl.col("license").is_null()  # null = unknown, keep (benefit of doubt)
