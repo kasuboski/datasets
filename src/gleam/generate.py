@@ -1,12 +1,14 @@
 """Production SFT instruction pair generator for Gleam.
 
 Generates ~14K instruction-response pairs from the filtered Gleam corpus
-using NeuralWatt Qwen3.6-35B Fast (primary) or Z.AI GLM-5.1 (fallback).
+using NeuralWatt Qwen3.6-35B Fast (primary), Cerebras GPT OSS 120B (fast),
+or Z.AI GLM-5.1 (fallback).
 
 Features:
   - Crash-resilient: appends JSONL after each request, state file after each file
   - Resumable: reads state file on startup, skips already-processed files
-  - Cost guard: stops when account balance drops below threshold
+  - Cost guard: stops when account balance drops below threshold (NeuralWatt)
+  - Cost estimation for Cerebras ($0.35/M input, $0.75/M output)
   - Structured logging to file + stdout
   - 3 task types per file (code_gen, explanation, completion) → ~14K pairs from ~4.7K files
 
@@ -16,6 +18,10 @@ Usage:
     --output data/sft/generation.jsonl \
     [--max-files 4700] \
     [--balance-limit 0.50]
+
+  # Cerebras (fast: ~2h for full run, ~3K tok/s)
+  CEREBRAS_API_KEY=csk-xxx python -m datasets.gleam.generate \
+    --provider cerebras --max-files 4700
 
 Resume after crash:
   Just re-run the same command — it reads generation_state.json to find progress.
@@ -57,6 +63,19 @@ PROVIDERS = {
         "gap_seconds": 0.5,
         "extra_body": {},
         "max_tokens": 4096,
+        # Pricing: $0.056/M input, $0.312/M output (imputed from production data)
+        # Balance guard: reads allowance_remaining_usd from response
+    },
+    "cerebras": {
+        "base_url": "https://api.cerebras.ai/v1",
+        "model": "gpt-oss-120b",
+        "api_key_env": "CEREBRAS_API_KEY",
+        "gap_seconds": 0.1,
+        "extra_body": {"reasoning_effort": "low"},
+        "max_tokens": 4096,
+        # Pricing: $0.35/M input, $0.75/M output
+        # Rate limits (Developer): 1K RPM / 1M input tok/min
+        # Speed: ~3000 tok/s output, ~50K tok/s prefill
     },
     "zai": {
         "base_url": "https://api.z.ai/api/coding/paas/v4",
@@ -264,13 +283,34 @@ def call_api(
             result["input_tokens"] = response.usage.prompt_tokens or 0
             result["output_tokens"] = response.usage.completion_tokens or 0
 
+        # Provider-specific fields
+        raw = response.model_dump()
+
         # NeuralWatt energy/cost
         if provider == "neuralwatt":
-            raw = response.model_dump()
             if "energy" in raw and isinstance(raw["energy"], dict):
                 result["nw_energy"] = raw["energy"]
             if "cost" in raw and isinstance(raw["cost"], dict):
                 result["nw_cost"] = raw["cost"]
+
+        # Cerebras: reasoning, timing, cached tokens, cost estimation
+        if provider == "cerebras":
+            # Capture reasoning if present (included in completion_tokens)
+            if hasattr(choice.message, "reasoning") and choice.message.reasoning:
+                result["reasoning"] = choice.message.reasoning
+            # Timing breakdown
+            if "time_info" in raw and isinstance(raw["time_info"], dict):
+                result["time_info"] = raw["time_info"]
+            # Cached tokens (system prompt reuse)
+            cached = 0
+            if hasattr(response.usage, "prompt_tokens_details") and response.usage.prompt_tokens_details:
+                cached = getattr(response.usage.prompt_tokens_details, "cached_tokens", 0) or 0
+            result["cached_input_tokens"] = cached
+            # Cost estimation ($0.35/M input, $0.75/M output)
+            billable_input = max(0, result["input_tokens"] - cached)
+            result["estimated_cost_usd"] = (
+                billable_input / 1e6 * 0.35 + result["output_tokens"] / 1e6 * 0.75
+            )
 
         return result
 
@@ -341,12 +381,20 @@ def load_corpus_files(
     max_files: int,
     seed: int,
     exclude_repos: list[str] | None = None,
+    max_input_tokens: int | None = None,
     logger: logging.Logger | None = None,
 ) -> list[dict]:
     """Load and shuffle files from corpus.
 
     If corpus_path is None or 'huggingface', downloads from
     kasuboski/gleam-code-corpus (all split). Otherwise loads local parquet.
+
+    Args:
+        max_input_tokens: If set, drop files whose source code would likely
+            exceed this many input tokens. Estimated from character count
+            using a ~3 chars/token heuristic (empirically calibrated for
+            Gleam code on Qwen tokenizers). Only ~1% of files near the
+            threshold will be misclassified. Set to 0 or negative to disable.
     """
     import polars as pl
 
@@ -373,6 +421,33 @@ def load_corpus_files(
         df = df.filter(~pl.col("repo_name").is_in(exclude_repos))
         if logger:
             logger.info(f"Excluded {before - len(df)} files from {exclude_repos}")
+
+    # Filter out oversized files
+    # Large files (>3K input tokens) produce worse output (10.9% truncation,
+    # 13.7% no valid Gleam) at 2.3× the cost. We estimate tokens from
+    # character count using the median ratio measured from production data.
+    #
+    # The template overhead is measured by building a dummy prompt with empty
+    # code, so it automatically adjusts if the system prompt or templates change
+    # (e.g. adding Gleam docs to the system prompt).
+    if max_input_tokens and max_input_tokens > 0:
+        _CHARS_PER_TOKEN = 2.96  # median ratio from 2,158 production files
+        # Measure actual template overhead (code_gen is worst case — full source)
+        _dummy_spec = build_prompt_for_file(
+            file_id="", code="", file_path="", repo_name="", task_type="code_gen",
+        )
+        _template_chars = sum(len(m["content"]) for m in _dummy_spec.messages)
+        _template_tokens = _template_chars / _CHARS_PER_TOKEN
+        max_code_chars = int((max_input_tokens - _template_tokens) * _CHARS_PER_TOKEN)
+        before = len(df)
+        df = df.filter(pl.col("code").str.len_chars() <= max_code_chars)
+        if logger:
+            logger.info(
+                f"Filtered {before - len(df)} oversized files "
+                f"(code > {max_code_chars:,} chars ≈ {max_input_tokens:,} input tokens, "
+                f"template overhead {_template_tokens:.0f} tokens), "
+                f"{len(df)} remaining"
+            )
 
     # Sample if needed
     total_before = len(df)
@@ -490,7 +565,7 @@ def run_generation(
                 nw_energy = result.get("nw_energy", {})
                 nw_cost = result.get("nw_cost", {})
                 energy_j = nw_energy.get("energy_joules", 0)
-                cost_usd = nw_cost.get("request_cost_usd", 0)
+                cost_usd = nw_cost.get("request_cost_usd", 0) or result.get("estimated_cost_usd", 0)
                 balance = nw_cost.get("allowance_remaining_usd")
                 state.total_energy_j += energy_j
                 state.total_cost_usd += cost_usd
@@ -550,6 +625,10 @@ Examples:
   NEURALWATT_API_KEY=sk-xxx python src/gleam/generate.py \\
       --provider neuralwatt --max-files 4700
 
+  # Cerebras (fast: ~2h for full run, ~3K tok/s)
+  CEREBRAS_API_KEY=csk-xxx python src/gleam/generate.py \\
+      --provider cerebras --max-files 4700
+
   # Resume after crash (just re-run same command)
   NEURALWATT_API_KEY=sk-xxx python src/gleam/generate.py \\
       --provider neuralwatt --max-files 4700
@@ -560,7 +639,7 @@ Examples:
         """,
     )
     parser.add_argument(
-        "--provider", choices=["neuralwatt", "zai"], default="neuralwatt",
+        "--provider", choices=["neuralwatt", "cerebras", "zai"], default="neuralwatt",
         help="API provider (default: neuralwatt)",
     )
     parser.add_argument(
@@ -585,7 +664,7 @@ Examples:
     )
     parser.add_argument(
         "--balance-limit", type=float, default=0.50,
-        help="Stop when NeuralWatt balance drops below this (default: 0.50)",
+        help="Stop when NeuralWatt balance drops below this (default: 0.50). Ignored for other providers.",
     )
     parser.add_argument(
         "--seed", type=int, default=42,
@@ -594,6 +673,14 @@ Examples:
     parser.add_argument(
         "--max-retries", type=int, default=3,
         help="Max retries per request (default: 3)",
+    )
+    parser.add_argument(
+        "--max-input-tokens", type=int, default=3000,
+        help=(
+            "Drop files whose source code likely exceeds this many input tokens. "
+            "Estimated from char count (r=0.956 correlation). Large files produce "
+            "worse output at higher cost. Set to 0 to disable. (default: 3000)"
+        ),
     )
 
     args = parser.parse_args()
@@ -628,6 +715,7 @@ Examples:
         max_files=args.max_files,
         seed=args.seed,
         exclude_repos=["monks_of_style"],  # semi-generated, exclude
+        max_input_tokens=args.max_input_tokens,
         logger=logger,
     )
 

@@ -23,11 +23,12 @@
 set -euo pipefail
 
 # --- Config ---
-PROVIDER="${PROVIDER:-neuralwatt}"
+PROVIDER="${PROVIDER:-cerebras}"
 MAX_FILES="${MAX_FILES:-4700}"
 BALANCE_LIMIT="${BALANCE_LIMIT:-0.50}"
 MAX_RESTARTS="${MAX_RESTARTS:-5}"
 SEED="${SEED:-42}"
+MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-3000}"
 NO_TMUX="${NO_TMUX:-false}"
 
 # --- Paths ---
@@ -49,6 +50,11 @@ if [ "$PROVIDER" = "zai" ] && [ -z "${ZAI_API_KEY:-}" ]; then
     echo "  export ZAI_API_KEY=xxx"
     exit 1
 fi
+if [ "$PROVIDER" = "cerebras" ] && [ -z "${CEREBRAS_API_KEY:-}" ]; then
+    echo "ERROR: CEREBRAS_API_KEY not set"
+    echo "  export CEREBRAS_API_KEY=csk-xxx"
+    exit 1
+fi
 
 # --- Tmux ---
 if [ "$NO_TMUX" != "true" ] && [ -z "${TMUX:-}" ]; then
@@ -62,7 +68,7 @@ if [ "$NO_TMUX" != "true" ] && [ -z "${TMUX:-}" ]; then
     echo "  Attach with: tmux attach -t gleam-gen"
     echo "  Detach with: Ctrl+B then D"
     tmux new-session -d -s gleam-gen -c "$PROJECT_DIR" \
-        "NEURALWATT_API_KEY=${NEURALWATT_API_KEY:-} ZAI_API_KEY=${ZAI_API_KEY:-} PROVIDER=$PROVIDER MAX_FILES=$MAX_FILES BALANCE_LIMIT=$BALANCE_LIMIT SEED=$SEED NO_TMUX=true $0; echo '--- Generation finished at \$(date -u) ---'; sleep 86400"
+        "NEURALWATT_API_KEY=${NEURALWATT_API_KEY:-} ZAI_API_KEY=${ZAI_API_KEY:-} CEREBRAS_API_KEY=${CEREBRAS_API_KEY:-} PROVIDER=$PROVIDER MAX_FILES=$MAX_FILES BALANCE_LIMIT=$BALANCE_LIMIT MAX_INPUT_TOKENS=$MAX_INPUT_TOKENS SEED=$SEED NO_TMUX=true $0; echo '--- Generation finished at \$(date -u) ---'; sleep 86400"
     exit 0
 fi
 
@@ -95,6 +101,7 @@ while [ $restart -lt $MAX_RESTARTS ]; do
         --provider "$PROVIDER" \
         --max-files "$MAX_FILES" \
         --balance-limit "$BALANCE_LIMIT" \
+        --max-input-tokens "$MAX_INPUT_TOKENS" \
         --seed "$SEED" \
         2>&1 | tee -a "$RUN_LOG"
 
