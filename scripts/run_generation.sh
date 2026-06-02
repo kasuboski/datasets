@@ -29,6 +29,7 @@ BALANCE_LIMIT="${BALANCE_LIMIT:-0.50}"
 MAX_RESTARTS="${MAX_RESTARTS:-5}"
 SEED="${SEED:-42}"
 MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-3000}"
+WORKERS="${WORKERS:-10}"
 NO_TMUX="${NO_TMUX:-false}"
 
 # --- Paths ---
@@ -68,7 +69,7 @@ if [ "$NO_TMUX" != "true" ] && [ -z "${TMUX:-}" ]; then
     echo "  Attach with: tmux attach -t gleam-gen"
     echo "  Detach with: Ctrl+B then D"
     tmux new-session -d -s gleam-gen -c "$PROJECT_DIR" \
-        "NEURALWATT_API_KEY=${NEURALWATT_API_KEY:-} ZAI_API_KEY=${ZAI_API_KEY:-} CEREBRAS_API_KEY=${CEREBRAS_API_KEY:-} PROVIDER=$PROVIDER MAX_FILES=$MAX_FILES BALANCE_LIMIT=$BALANCE_LIMIT MAX_INPUT_TOKENS=$MAX_INPUT_TOKENS SEED=$SEED NO_TMUX=true $0; echo '--- Generation finished at \$(date -u) ---'; sleep 86400"
+        "NEURALWATT_API_KEY=${NEURALWATT_API_KEY:-} ZAI_API_KEY=${ZAI_API_KEY:-} CEREBRAS_API_KEY=${CEREBRAS_API_KEY:-} PROVIDER=$PROVIDER MAX_FILES=$MAX_FILES BALANCE_LIMIT=$BALANCE_LIMIT MAX_INPUT_TOKENS=$MAX_INPUT_TOKENS WORKERS=$WORKERS SEED=$SEED NO_TMUX=true $0; echo '--- Generation finished at \$(date -u) ---'; sleep 86400"
     exit 0
 fi
 
@@ -85,6 +86,7 @@ echo "=========================================="
 echo "Gleam SFT Generation Run"
 echo "  Provider:      $PROVIDER"
 echo "  Max files:     $MAX_FILES"
+echo "  Workers:       $WORKERS"
 echo "  Balance limit: \$$BALANCE_LIMIT"
 echo "  Seed:          $SEED"
 echo "  Max restarts:  $MAX_RESTARTS"
@@ -102,6 +104,7 @@ while [ $restart -lt $MAX_RESTARTS ]; do
         --max-files "$MAX_FILES" \
         --balance-limit "$BALANCE_LIMIT" \
         --max-input-tokens "$MAX_INPUT_TOKENS" \
+        --workers "$WORKERS" \
         --seed "$SEED" \
         2>&1 | tee -a "$RUN_LOG"
 

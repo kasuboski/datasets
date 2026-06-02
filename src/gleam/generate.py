@@ -35,6 +35,7 @@ import logging
 import os
 import random
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -465,72 +466,43 @@ def load_corpus_files(
 
     return files
 
-
 # ---------------------------------------------------------------------------
-# Main generation loop
+# Concurrent file processing
 # ---------------------------------------------------------------------------
 
-def run_generation(
+def _process_file(
+    file_data: dict,
+    client,
     provider: str,
-    files: list[dict],
-    output_path: Path,
+    cfg: dict,
     state: GenerationState,
+    output_path: Path,
     logger: logging.Logger,
-    balance_limit: float = 0.50,
-    max_retries: int = 3,
+    lock: threading.Lock,
+    stop_event: threading.Event,
+    balance_limit: float,
+    max_retries: int,
 ) -> None:
-    """Main generation loop. Processes files, writes JSONL, manages state."""
+    """Process a single file: generate all 3 task types, write results."""
+    file_id = file_data["id"]
 
-    from openai import OpenAI
+    for task_type in TASK_TYPES:
+        if stop_event.is_set():
+            return
 
-    cfg = PROVIDERS[provider]
-    client = OpenAI(
-        api_key=os.environ[cfg["api_key_env"]],
-        base_url=cfg["base_url"],
-    )
+        spec = build_prompt_for_file(
+            file_id=file_id,
+            code=file_data["code"],
+            file_path=file_data["file_path"],
+            repo_name=file_data["repo_name"],
+            task_type=task_type,
+        )
 
-    # Filter to only unprocessed files
-    remaining = [f for f in files if not state.is_completed(f["id"])]
-    logger.info(f"\n{'='*60}")
-    logger.info(f"GENERATION: {provider} | {cfg['model']}")
-    logger.info(f"  Files remaining: {len(remaining)} / {len(files)} total")
-    logger.info(f"  Pairs so far:    {state.total_pairs}")
-    logger.info(f"  Cost so far:     ${state.total_cost_usd:.4f}")
-    logger.info(f"  Output:          {output_path}")
-    logger.info(f"  Balance limit:   ${balance_limit:.2f}")
-    logger.info(f"{'='*60}\n")
+        result = call_with_retry(
+            client, provider, spec.messages, cfg, logger, max_retries=max_retries,
+        )
 
-    if not state.start_time:
-        state.start_time = time.time()
-
-    consecutive_errors = 0
-    max_consecutive_errors = 10
-
-    for i, file_data in enumerate(remaining):
-        file_id = file_data["id"]
-
-        # Check if we should stop
-        if consecutive_errors >= max_consecutive_errors:
-            logger.error(f"Too many consecutive errors ({consecutive_errors}). Stopping.")
-            break
-
-        # Generate all task types for this file (matches pilot: 3 pairs per file)
-        for task_type in TASK_TYPES:
-            # Build prompt
-            spec = build_prompt_for_file(
-                file_id=file_id,
-                code=file_data["code"],
-                file_path=file_data["file_path"],
-                repo_name=file_data["repo_name"],
-                task_type=task_type,
-            )
-
-            # Call API with retry
-            result = call_with_retry(
-                client, provider, spec.messages, cfg, logger, max_retries=max_retries,
-            )
-
-            # Build record
+        with lock:
             record = {
                 "request_id": f"{provider}_{state.total_pairs:06d}",
                 "provider": provider,
@@ -544,24 +516,19 @@ def run_generation(
                 **result,
             }
 
-            # Write immediately (crash resilience)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             with open(output_path, "a") as f:
                 f.write(json.dumps(record) + "\n")
 
-            # Update state
             if result.get("error"):
                 state.total_errors += 1
-                consecutive_errors += 1
-                logger.info(f"  [{state.total_pairs + 1:5d}] FAIL {file_id[:50]:50s} | {task_type:12s} | {result['error'][:60]}")
+                logger.info(f"  [{state.total_pairs + state.total_errors + 1:5d}] FAIL {file_id[:50]:50s} | {task_type:12s} | {result['error'][:60]}")
             else:
-                consecutive_errors = 0
                 state.total_pairs += 1
                 wall = result["wall_time_ms"] / 1000
                 out_tok = result["output_tokens"]
                 tps = out_tok / wall if wall > 0 else 0
 
-                # Track cost/energy
                 nw_energy = result.get("nw_energy", {})
                 nw_cost = result.get("nw_cost", {})
                 energy_j = nw_energy.get("energy_joules", 0)
@@ -572,29 +539,189 @@ def run_generation(
                 if balance is not None:
                     state.last_balance_usd = balance
 
-                # Progress log
                 elapsed = time.time() - state.start_time
-                remaining_pairs = len(remaining) * len(TASK_TYPES) - (i * len(TASK_TYPES) + TASK_TYPES.index(task_type)) - 1
-                eta = (elapsed / state.total_pairs) * remaining_pairs if state.total_pairs > 0 else 0
+                pairs_per_sec = state.total_pairs / elapsed if elapsed > 0 else 0
                 logger.info(
                     f"  [{state.total_pairs:5d}] OK   {file_id[:50]:50s} | {task_type:12s} "
                     f"| {wall:5.1f}s | {tps:5.0f} tok/s | {out_tok:5d} out "
                     f"| ${state.total_cost_usd:.4f} total "
-                    f"| ETA {eta/3600:.1f}h"
+                    f"| {pairs_per_sec:.1f} pairs/s"
                     + (f" | bal=${balance:.2f}" if balance is not None else "")
                 )
 
-                # Balance guard
                 if balance is not None and balance < balance_limit:
                     logger.warning(f"\n⚠ Balance ${balance:.4f} below limit ${balance_limit:.2f}. Stopping.")
+                    stop_event.set()
                     state.mark_completed(file_id)
                     return
 
-            # Rate limiting gap between requests
-            time.sleep(cfg["gap_seconds"])
+        # Per-request gap (only meaningful in single-worker mode)
+        time.sleep(cfg["gap_seconds"])
 
-        # Mark file completed after all task types
+    with lock:
         state.mark_completed(file_id)
+
+
+# ---------------------------------------------------------------------------
+# Main generation loop
+# ---------------------------------------------------------------------------
+
+def run_generation(
+    provider: str,
+    files: list[dict],
+    output_path: Path,
+    state: GenerationState,
+    logger: logging.Logger,
+    balance_limit: float = 0.50,
+    max_retries: int = 3,
+    workers: int = 1,
+) -> None:
+    """Main generation loop. Processes files, writes JSONL, manages state."""
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from openai import OpenAI
+
+    cfg = PROVIDERS[provider]
+    client = OpenAI(
+        api_key=os.environ[cfg["api_key_env"]],
+        base_url=cfg["base_url"],
+    )
+
+    # Filter to only unprocessed files
+    remaining = [f for f in files if not state.is_completed(f["id"])]
+    logger.info(f"\n{'='*60}")
+    logger.info(f"GENERATION: {provider} | {cfg['model']} | {workers} worker(s)")
+    logger.info(f"  Files remaining: {len(remaining)} / {len(files)} total")
+    logger.info(f"  Pairs so far:    {state.total_pairs}")
+    logger.info(f"  Cost so far:     ${state.total_cost_usd:.4f}")
+    logger.info(f"  Output:          {output_path}")
+    logger.info(f"  Balance limit:   ${balance_limit:.2f}")
+    logger.info(f"{'='*60}\n")
+
+    if not state.start_time:
+        state.start_time = time.time()
+
+    stop_event = threading.Event()
+    lock = threading.Lock()
+
+    if workers <= 1:
+        # Sequential mode (original behavior)
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+
+        for i, file_data in enumerate(remaining):
+            if stop_event.is_set():
+                break
+
+            file_id = file_data["id"]
+
+            if consecutive_errors >= max_consecutive_errors:
+                logger.error(f"Too many consecutive errors ({consecutive_errors}). Stopping.")
+                break
+
+            for task_type in TASK_TYPES:
+                spec = build_prompt_for_file(
+                    file_id=file_id,
+                    code=file_data["code"],
+                    file_path=file_data["file_path"],
+                    repo_name=file_data["repo_name"],
+                    task_type=task_type,
+                )
+
+                result = call_with_retry(
+                    client, provider, spec.messages, cfg, logger, max_retries=max_retries,
+                )
+
+                record = {
+                    "request_id": f"{provider}_{state.total_pairs:06d}",
+                    "provider": provider,
+                    "model": cfg["model"],
+                    "task_type": task_type,
+                    "source_file_id": file_id,
+                    "source_file_path": file_data["file_path"],
+                    "source_repo": file_data["repo_name"],
+                    "source_stars": file_data.get("stars"),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    **result,
+                }
+
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(output_path, "a") as f:
+                    f.write(json.dumps(record) + "\n")
+
+                if result.get("error"):
+                    state.total_errors += 1
+                    consecutive_errors += 1
+                    logger.info(f"  [{state.total_pairs + 1:5d}] FAIL {file_id[:50]:50s} | {task_type:12s} | {result['error'][:60]}")
+                else:
+                    consecutive_errors = 0
+                    state.total_pairs += 1
+                    wall = result["wall_time_ms"] / 1000
+                    out_tok = result["output_tokens"]
+                    tps = out_tok / wall if wall > 0 else 0
+
+                    nw_energy = result.get("nw_energy", {})
+                    nw_cost = result.get("nw_cost", {})
+                    energy_j = nw_energy.get("energy_joules", 0)
+                    cost_usd = nw_cost.get("request_cost_usd", 0) or result.get("estimated_cost_usd", 0)
+                    balance = nw_cost.get("allowance_remaining_usd")
+                    state.total_energy_j += energy_j
+                    state.total_cost_usd += cost_usd
+                    if balance is not None:
+                        state.last_balance_usd = balance
+
+                    elapsed = time.time() - state.start_time
+                    remaining_pairs = len(remaining) * len(TASK_TYPES) - (i * len(TASK_TYPES) + TASK_TYPES.index(task_type)) - 1
+                    eta = (elapsed / state.total_pairs) * remaining_pairs if state.total_pairs > 0 else 0
+                    logger.info(
+                        f"  [{state.total_pairs:5d}] OK   {file_id[:50]:50s} | {task_type:12s} "
+                        f"| {wall:5.1f}s | {tps:5.0f} tok/s | {out_tok:5d} out "
+                        f"| ${state.total_cost_usd:.4f} total "
+                        f"| ETA {eta/3600:.1f}h"
+                        + (f" | bal=${balance:.2f}" if balance is not None else "")
+                    )
+
+                    if balance is not None and balance < balance_limit:
+                        logger.warning(f"\n⚠ Balance ${balance:.4f} below limit ${balance_limit:.2f}. Stopping.")
+                        state.mark_completed(file_id)
+                        return
+
+                time.sleep(cfg["gap_seconds"])
+
+            state.mark_completed(file_id)
+    else:
+        # Concurrent mode
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {}
+            for file_data in remaining:
+                if stop_event.is_set():
+                    break
+                future = executor.submit(
+                    _process_file,
+                    file_data=file_data,
+                    client=client,
+                    provider=provider,
+                    cfg=cfg,
+                    state=state,
+                    output_path=output_path,
+                    logger=logger,
+                    lock=lock,
+                    stop_event=stop_event,
+                    balance_limit=balance_limit,
+                    max_retries=max_retries,
+                )
+                futures[future] = file_data["id"]
+
+            for future in as_completed(futures):
+                file_id = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"  Worker error on {file_id[:50]}: {e}")
+
+                if stop_event.is_set():
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
 
     # Final summary
     elapsed = time.time() - state.start_time if state.start_time else 0
@@ -675,6 +802,14 @@ Examples:
         help="Max retries per request (default: 3)",
     )
     parser.add_argument(
+        "--workers", type=int, default=1,
+        help=(
+            "Number of concurrent workers. Use >1 for Cerebras "
+            "(rate limit: 1K RPM). 10 workers ≈ 40min for full run. "
+            "(default: 1)"
+        ),
+    )
+    parser.add_argument(
         "--max-input-tokens", type=int, default=3000,
         help=(
             "Drop files whose source code likely exceeds this many input tokens. "
@@ -733,6 +868,7 @@ Examples:
             logger=logger,
             balance_limit=args.balance_limit,
             max_retries=args.max_retries,
+            workers=args.workers,
         )
     except KeyboardInterrupt:
         logger.info("\n⚠ Interrupted by user. State saved. Re-run to resume.")
