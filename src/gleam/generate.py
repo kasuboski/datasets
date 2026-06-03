@@ -37,6 +37,8 @@ import random
 import sys
 import threading
 import time
+
+import httpx
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -78,6 +80,17 @@ PROVIDERS = {
         # Rate limits (Developer): 1K RPM / 1M input tok/min
         # Speed: ~3000 tok/s output, ~50K tok/s prefill
     },
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "openai/gpt-oss-120b",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "gap_seconds": 0.1,
+        "extra_body": {"provider": {"order": ["Groq"]}},
+        "max_tokens": 4096,
+        # Pricing: $0.039/M input, $0.18/M output (OpenRouter, routes to cheapest provider)
+        # Speed: ~339 tok/s (via Groq), varies by provider
+        # Rate limits: generous (OpenRouter handles provider routing)
+    },
     "zai": {
         "base_url": "https://api.z.ai/api/coding/paas/v4",
         "model": "glm-5.1",
@@ -92,6 +105,11 @@ TASK_TYPES = ["code_gen", "explanation", "completion"]
 # Each file gets all 3 task types → 3 pairs per file
 # Matches the pilot: 10 files × 3 types = 30 requests per provider
 # with remaining budget going to more code_gen/completion variants
+
+# Per-task-type max_tokens overrides (falls back to provider default)
+TASK_MAX_TOKENS = {
+    "explanation": 8192,  # explanations are verbose; 4096 truncated 22%
+}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -255,6 +273,7 @@ def call_api(
     provider: str,
     messages: list[dict],
     cfg: dict,
+    max_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Make a single API call. Returns result dict."""
     t0 = time.time()
@@ -262,7 +281,7 @@ def call_api(
         kwargs = dict(
             model=cfg["model"],
             messages=messages,
-            max_tokens=cfg["max_tokens"],
+            max_tokens=max_tokens or cfg["max_tokens"],
             temperature=0.7,
         )
         if cfg.get("extra_body"):
@@ -307,10 +326,16 @@ def call_api(
             if hasattr(response.usage, "prompt_tokens_details") and response.usage.prompt_tokens_details:
                 cached = getattr(response.usage.prompt_tokens_details, "cached_tokens", 0) or 0
             result["cached_input_tokens"] = cached
-            # Cost estimation ($0.35/M input, $0.75/M output)
+            # Cost estimation (per-provider pricing)
             billable_input = max(0, result["input_tokens"] - cached)
+            input_price, output_price = {
+                "neuralwatt": (0.056, 0.312),
+                "cerebras": (0.35, 0.75),
+                "openrouter": (0.039, 0.18),
+                "zai": (0, 0),  # unknown pricing
+            }.get(provider, (0, 0))
             result["estimated_cost_usd"] = (
-                billable_input / 1e6 * 0.35 + result["output_tokens"] / 1e6 * 0.75
+                billable_input / 1e6 * input_price + result["output_tokens"] / 1e6 * output_price
             )
 
         return result
@@ -339,10 +364,11 @@ def call_with_retry(
     logger: logging.Logger,
     max_retries: int = 3,
     base_delay: float = 5.0,
+    max_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Call API with exponential backoff retry."""
     for attempt in range(max_retries + 1):
-        result = call_api(client, provider, messages, cfg)
+        result = call_api(client, provider, messages, cfg, max_tokens=max_tokens)
 
         if not result.get("error"):
             return result
@@ -482,11 +508,12 @@ def _process_file(
     stop_event: threading.Event,
     balance_limit: float,
     max_retries: int,
+    task_types: list[str] | None = None,
 ) -> None:
-    """Process a single file: generate all 3 task types, write results."""
+    """Process a single file: generate specified task types, write results."""
     file_id = file_data["id"]
 
-    for task_type in TASK_TYPES:
+    for task_type in (task_types or TASK_TYPES):
         if stop_event.is_set():
             return
 
@@ -500,6 +527,7 @@ def _process_file(
 
         result = call_with_retry(
             client, provider, spec.messages, cfg, logger, max_retries=max_retries,
+            max_tokens=TASK_MAX_TOKENS.get(task_type),
         )
 
         with lock:
@@ -575,22 +603,37 @@ def run_generation(
     balance_limit: float = 0.50,
     max_retries: int = 3,
     workers: int = 1,
+    task_types: list[str] | None = None,
+    force: bool = False,
 ) -> None:
     """Main generation loop. Processes files, writes JSONL, manages state."""
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from openai import OpenAI
 
+    active_task_types = task_types or TASK_TYPES
+
     cfg = PROVIDERS[provider]
     client = OpenAI(
         api_key=os.environ[cfg["api_key_env"]],
         base_url=cfg["base_url"],
+        timeout=httpx.Timeout(
+            connect=10.0,  # 10s to establish connection
+            read=120.0,    # 2 min between bytes — kill stalled responses
+            write=30.0,    # 30s to send request
+            pool=10.0,     # 10s to acquire connection from pool
+        ),
     )
 
     # Filter to only unprocessed files
-    remaining = [f for f in files if not state.is_completed(f["id"])]
+    if force:
+        remaining = files
+        logger.info(f"  --force: reprocessing all {len(files)} files")
+    else:
+        remaining = [f for f in files if not state.is_completed(f["id"])]
     logger.info(f"\n{'='*60}")
     logger.info(f"GENERATION: {provider} | {cfg['model']} | {workers} worker(s)")
+    logger.info(f"  Task types:      {active_task_types}")
     logger.info(f"  Files remaining: {len(remaining)} / {len(files)} total")
     logger.info(f"  Pairs so far:    {state.total_pairs}")
     logger.info(f"  Cost so far:     ${state.total_cost_usd:.4f}")
@@ -619,7 +662,7 @@ def run_generation(
                 logger.error(f"Too many consecutive errors ({consecutive_errors}). Stopping.")
                 break
 
-            for task_type in TASK_TYPES:
+            for task_type in active_task_types:
                 spec = build_prompt_for_file(
                     file_id=file_id,
                     code=file_data["code"],
@@ -630,6 +673,7 @@ def run_generation(
 
                 result = call_with_retry(
                     client, provider, spec.messages, cfg, logger, max_retries=max_retries,
+                    max_tokens=TASK_MAX_TOKENS.get(task_type),
                 )
 
                 record = {
@@ -671,7 +715,7 @@ def run_generation(
                         state.last_balance_usd = balance
 
                     elapsed = time.time() - state.start_time
-                    remaining_pairs = len(remaining) * len(TASK_TYPES) - (i * len(TASK_TYPES) + TASK_TYPES.index(task_type)) - 1
+                    remaining_pairs = len(remaining) * len(active_task_types) - (i * len(active_task_types) + active_task_types.index(task_type)) - 1
                     eta = (elapsed / state.total_pairs) * remaining_pairs if state.total_pairs > 0 else 0
                     logger.info(
                         f"  [{state.total_pairs:5d}] OK   {file_id[:50]:50s} | {task_type:12s} "
@@ -709,6 +753,7 @@ def run_generation(
                     stop_event=stop_event,
                     balance_limit=balance_limit,
                     max_retries=max_retries,
+                    task_types=active_task_types,
                 )
                 futures[future] = file_data["id"]
 
@@ -766,7 +811,7 @@ Examples:
         """,
     )
     parser.add_argument(
-        "--provider", choices=["neuralwatt", "cerebras", "zai"], default="neuralwatt",
+        "--provider", choices=["neuralwatt", "cerebras", "zai", "openrouter"], default="neuralwatt",
         help="API provider (default: neuralwatt)",
     )
     parser.add_argument(
@@ -810,6 +855,17 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--task-types", nargs="+", choices=TASK_TYPES, default=None,
+        help=(
+            "Only run these task types (e.g. --task-types explanation). "
+            "Default: all three (code_gen explanation completion)."
+        ),
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Ignore resume state — reprocess all files (use with --task-types to rerun specific tasks).",
+    )
+    parser.add_argument(
         "--max-input-tokens", type=int, default=3000,
         help=(
             "Drop files whose source code likely exceeds this many input tokens. "
@@ -826,6 +882,12 @@ Examples:
 
     state_file = args.state_file or output_dir / "generation_state.json"
     log_file = args.log_file or output_dir / "generation.log"
+
+    # In force mode, use a separate state file to avoid corrupting the original
+    if args.force and not args.state_file:
+        task_suffix = "_" + "_".join(args.task_types) if args.task_types else "all"
+        state_file = output_dir / f"generation_state_{task_suffix}.json"
+        log_file = output_dir / f"generation_{task_suffix}.log"
 
     # Setup logging
     logger = setup_logging(log_file)
@@ -859,6 +921,10 @@ Examples:
         sys.exit(1)
 
     # Run
+    # Determine task types to run
+    active_task_types = args.task_types or TASK_TYPES
+    logger.info(f"Task types: {active_task_types} {'(forced)' if args.force else ''}")
+
     try:
         run_generation(
             provider=args.provider,
@@ -869,6 +935,8 @@ Examples:
             balance_limit=args.balance_limit,
             max_retries=args.max_retries,
             workers=args.workers,
+            task_types=active_task_types,
+            force=args.force,
         )
     except KeyboardInterrupt:
         logger.info("\n⚠ Interrupted by user. State saved. Re-run to resume.")
