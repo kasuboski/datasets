@@ -103,6 +103,7 @@ def main():
             "repo_name": row["repo_name"],
             "file_path": row["file_path"],
             "stars": row["stars"],
+            "repo_url": row.get("repo_url", ""),
         }
     print(f"  {len(code_lookup):,} source files")
 
@@ -137,6 +138,7 @@ def main():
         record = {
             "id": f"sft_gleam_{idx + 1:05d}",
             "source_file_id": file_id,
+            "source_repo_url": source["repo_url"],
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
