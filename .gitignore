@@ -5,9 +5,6 @@ data/
 STATUS.md
 GOAL.md
 
-# Agent config
-.pi/
-
 # Python-generated files
 __pycache__/
 *.py[oc]
