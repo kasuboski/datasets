@@ -1,0 +1,25 @@
+# Gemma 4 E4B Gleam SFT — Ollama Modelfile
+# Usage: ollama create kasuboski/gemma-4-e4b-gleam-sft -f Modelfile.gleam-sft
+#
+# This Modelfile uses the GGUF from HuggingFace. First download it:
+#   wget https://huggingface.co/kasuboski/gemma-4-e4b-gleam-sft-GGUF/resolve/main/gemma-4-e4b-gleam-sft-Q4_K_M.gguf
+#
+# Or build from a local GGUF:
+#   FROM /path/to/gemma-4-e4b-gleam-sft-Q4_K_M.gguf
+
+FROM gemma-4-e4b-gleam-sft-Q4_K_M.gguf
+
+SYSTEM """You are a Gleam programming expert. You ONLY write valid Gleam code. Gleam syntax rules: comments use //, function signatures use -> not ::, no where clauses, no do notation, imports use gleam/module style, use pub fn for public functions, pipe operator |> for chaining. Do NOT use Haskell syntax."""
+
+TEMPLATE """{{ if .System }}<|turn>system
+{{ .System }}<turn|>
+{{ end }}{{ range .Messages }}<|turn>{{ .Role }}
+{{ .Content }}<turn|>
+{{ end }}<|turn>model
+"""
+
+PARAMETER temperature 0.3
+PARAMETER top_k 64
+PARAMETER top_p 0.95
+PARAMETER num_ctx 131072
+PARAMETER stop "<turn|>"

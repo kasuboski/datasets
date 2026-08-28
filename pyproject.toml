@@ -5,8 +5,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "datasets>=5.0.0",
     "huggingface-hub>=1.16.4",
+    "modal>=1.4.3",
     "openai>=1.82.0",
     "polars>=1.41.1",
     "requests>=2.34.2",
+    "trackio>=0.26.0",
 ]

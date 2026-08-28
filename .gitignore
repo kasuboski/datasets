@@ -5,6 +5,9 @@ data/
 STATUS.md
 GOAL.md
 
+# OS-generated files
+.DS_Store
+
 # Python-generated files
 __pycache__/
 *.py[oc]
